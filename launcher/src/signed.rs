@@ -61,13 +61,7 @@ pub fn build_digest(
     let sums = fetch(&asset_url(tag, SUMS))?;
     let signature = fetch(&asset_url(tag, SIGNATURE_V2))?
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
-    horizon_release_sign::build_digest(
-        version,
-        asset,
-        sums.as_deref(),
-        signature.as_deref(),
-        keys,
-    )
+    horizon_release_sign::build_digest(version, asset, sums.as_deref(), signature.as_deref(), keys)
 }
 
 #[cfg(test)]
@@ -214,5 +208,21 @@ mod tests {
         let release = serving("v0.2.81", "v0.2.81");
         assert!(digest("v0.2.81", "horizon.zip", &keys, &release).is_ok());
         assert!(build_digest("nightly", VERSION, "horizon.zip", &keys, &release).is_err());
+        // A snapshot installs with its own version's signature; it never passes for a Nightly, nor a
+        // Nightly for it, nor a snapshot for a release.
+        const SNAPSHOT: &str = "snapshot-2026-10-28-0c02067";
+        let snapshot = serving(horizon_release_sign::SNAPSHOT, SNAPSHOT);
+        assert_eq!(
+            build_digest(SNAPSHOT, SNAPSHOT, "horizon.zip", &keys, &snapshot),
+            Ok(sha256_hex(b"game"))
+        );
+        assert!(build_digest("nightly", VERSION, "horizon.zip", &keys, &snapshot).is_err());
+        assert!(build_digest(SNAPSHOT, SNAPSHOT, "horizon.zip", &keys, &nightly).is_err());
+        for tag in [SNAPSHOT, "snapshot"] {
+            assert!(
+                digest(tag, "horizon.zip", &keys, &snapshot).is_err(),
+                "{tag}"
+            );
+        }
     }
 }
