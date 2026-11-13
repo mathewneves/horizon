@@ -45,12 +45,13 @@ pub fn digest(
     horizon_release_sign::signed_digest(tag, asset, sums.as_deref(), signature.as_deref(), keys)
 }
 
-/// The signed SHA-256 of `asset` in the Nightly published under `tag` (`nightly`, or a dated
-/// `nightly-<date>`) that installs as `version` (`nightly-<date>-<commit>`, parsed strictly from its
-/// title by `horizon_release_sign::nightly_title_version`): its SHA256SUMS.v2.sig must sign the
-/// checksums for exactly that version, so an older Nightly can't be served as a newer one. The
-/// channel's SHA256SUMS.sig is for launchers from before and is not read.
-pub fn nightly_digest(
+/// The signed SHA-256 of `asset` in the Nightly or snapshot published under `tag` (`nightly`, a
+/// dated `nightly-<date>`, or `snapshot-<date>-<commit>`) that installs as `version`
+/// (`<channel>-<date>-<commit>`, parsed strictly from its title by
+/// `horizon_release_sign::build_title_version`): its SHA256SUMS.v2.sig must sign the checksums for
+/// exactly that version, so an older Nightly can't be served as a newer one, nor a snapshot as a
+/// Nightly. The channel's SHA256SUMS.sig is for launchers from before and is not read.
+pub fn build_digest(
     tag: &str,
     version: &str,
     asset: &str,
@@ -60,7 +61,7 @@ pub fn nightly_digest(
     let sums = fetch(&asset_url(tag, SUMS))?;
     let signature = fetch(&asset_url(tag, SIGNATURE_V2))?
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
-    horizon_release_sign::nightly_digest(
+    horizon_release_sign::build_digest(
         version,
         asset,
         sums.as_deref(),
@@ -182,11 +183,11 @@ mod tests {
         };
         let nightly = serving(horizon_release_sign::NIGHTLY, VERSION);
         assert_eq!(
-            nightly_digest("nightly", VERSION, "horizon.zip", &keys, &nightly),
+            build_digest("nightly", VERSION, "horizon.zip", &keys, &nightly),
             Ok(sha256_hex(b"game"))
         );
         // Another version than the one signed (an older Nightly served as tonight's, or the reverse).
-        assert!(nightly_digest(
+        assert!(build_digest(
             "nightly",
             "nightly-2026-10-29-1111111",
             "horizon.zip",
@@ -208,10 +209,10 @@ mod tests {
                 nightly(url)
             }
         };
-        let refused = nightly_digest("nightly", VERSION, "horizon.zip", &keys, old).unwrap_err();
+        let refused = build_digest("nightly", VERSION, "horizon.zip", &keys, old).unwrap_err();
         assert!(refused.contains("SHA256SUMS.v2.sig"), "{refused}");
         let release = serving("v0.2.81", "v0.2.81");
         assert!(digest("v0.2.81", "horizon.zip", &keys, &release).is_ok());
-        assert!(nightly_digest("nightly", VERSION, "horizon.zip", &keys, &release).is_err());
+        assert!(build_digest("nightly", VERSION, "horizon.zip", &keys, &release).is_err());
     }
 }
