@@ -513,14 +513,19 @@ fn rustc(rust: &Toolchain, game: &Path, out: &Path, edition: &str) -> Command {
 }
 
 /// Compiles the mods (`resolution`'s order, each with its installed mod dependencies) and the
-/// launcher's executable against the prebuilt game in `game`, into `out`. Returns the executable
-/// and the dynamic libraries it loads, to be installed beside it.
+/// launcher's executable against the prebuilt game in `game`, under `builds`
+/// (`native/prebuilt-build`): the rustc route in its `rustc` folder, rebuilt every time, and the
+/// registry route in the folder its cargo build is kept in ([`kept_build`]), staged per mods
+/// folder (`mods`). Returns the executable and the dynamic libraries it loads, to be installed
+/// beside it.
 // Unlike the source workspace, this route invokes rustc with only selected --extern
 // libraries; it does not resolve or compile arbitrary transitive Cargo dependencies.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn compile(
     rust: &Toolchain,
     game: &Path,
-    out: &Path,
+    builds: &Path,
+    mods: &Path,
     projects: &[api::Project<'_>],
     declared: &[Vec<dependencies::Dependency>],
     resolution: &dependencies::Resolution,
@@ -537,10 +542,13 @@ pub(super) fn compile(
             })
         })
     }) {
-        return super::registry_compile::compile(
+        let kept = builds.join(kept_build(rust, game)?);
+        let stage = kept.join(format!("stage-{}", short_hash(&mods_key(mods)?)));
+        let built = super::registry_compile::compile(
             rust,
             game,
-            out,
+            &stage,
+            &kept.join("target"),
             projects,
             declared,
             resolution,
@@ -548,8 +556,12 @@ pub(super) fn compile(
                 consent,
                 adapter: &std::env::current_exe().map_err(|e| e.to_string())?,
             },
-        );
+        )?;
+        // The Storage page's Build files row ages this unit by its last use.
+        crate::storage::mark_used(&kept).map_err(super::cache_error)?;
+        return Ok(built);
     }
+    let out = &builds.join("rustc");
     let catalog = internals::Catalog::read(game)?;
     let generated = catalog
         .prepare(projects.iter().map(|project| &project.bundle.manifest))
@@ -559,6 +571,7 @@ pub(super) fn compile(
     }
     let _ = fs::remove_dir_all(out);
     fs::create_dir_all(out).map_err(|e| e.to_string())?;
+    crate::storage::mark_used(out).map_err(super::cache_error)?;
     let deps = game.join("deps");
     let sdk = identity(game)?;
     let mut libraries = std::collections::HashMap::new();
@@ -717,6 +730,57 @@ pub(super) fn compile(
     cmd.arg("-o").arg(&binary).arg(&main);
     super::run(cmd, "Linking the game", |_| {})?;
     Ok((binary, runtime_libraries(rust, &deps)?))
+}
+
+/// The launcher's settings for a kept registry build: bumped whenever the launcher changes the
+/// cargo arguments, the compiler plan or how it stages, so a build made the old way is not reused.
+const KEPT_BUILD_FLAGS: u32 = 1;
+
+/// The folder a registry build's cargo output is kept in, under `native/prebuilt-build`: one per
+/// game build (its revision, its identity and its libraries), Rust toolchain and launcher
+/// settings ([`KEPT_BUILD_FLAGS`]). Inside one, cargo's own fingerprints decide what to rebuild.
+fn kept_build(rust: &Toolchain, game: &Path) -> Result<String, String> {
+    let sdk = identity(game)?;
+    let mut hasher = Sha256::new();
+    hasher.update(KEPT_BUILD_FLAGS.to_le_bytes());
+    hasher.update(rust_toolchain::VERSION.as_bytes());
+    hasher.update(rust.host.target.as_bytes());
+    hasher.update(fs::read(game.join(IDENTITY)).map_err(|e| e.to_string())?);
+    // The SDK's libraries reach rustc through the compiler plan, which cargo doesn't fingerprint:
+    // a game package whose libraries differ is another key.
+    let mut libraries: Vec<(String, u64)> = Vec::new();
+    for entry in fs::read_dir(game.join("deps")).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let length = entry.metadata().map_err(|e| e.to_string())?.len();
+        libraries.push((entry.file_name().to_string_lossy().into_owned(), length));
+    }
+    libraries.sort();
+    for (name, length) in libraries {
+        hasher.update(name.as_bytes());
+        hasher.update(length.to_le_bytes());
+    }
+    let revision = sdk.commit();
+    Ok(format!(
+        "{}-{}",
+        revision.get(..12).unwrap_or(revision),
+        short_hash(&format!("{:x}", hasher.finalize()))
+    ))
+}
+
+/// The key of the mods folder a build stages: one staging folder per instance (or per CLI or
+/// export folder), so instances never restage each other's files.
+fn mods_key(mods: &Path) -> Result<String, String> {
+    let path = mods
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", mods.display()))?;
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(path.to_string_lossy().as_bytes())
+    ))
+}
+
+fn short_hash(hex: &str) -> &str {
+    hex.get(..16).unwrap_or(hex)
 }
 
 /// The runtime shipped beside the prebuilt executable, for both native build routes.
