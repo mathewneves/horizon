@@ -543,6 +543,9 @@ pub(super) fn compile(
         })
     }) {
         let kept = builds.join(kept_build(rust, game)?);
+        // Stamped before it fills, so a build that fails still leaves an aged unit.
+        fs::create_dir_all(&kept).map_err(|e| e.to_string())?;
+        crate::storage::mark_used(&kept).map_err(super::cache_error)?;
         let stage = kept.join(format!("stage-{}", short_hash(&mods_key(mods)?)));
         let built = super::registry_compile::compile(
             rust,
@@ -746,18 +749,20 @@ fn kept_build(rust: &Toolchain, game: &Path) -> Result<String, String> {
     hasher.update(rust_toolchain::VERSION.as_bytes());
     hasher.update(rust.host.target.as_bytes());
     hasher.update(fs::read(game.join(IDENTITY)).map_err(|e| e.to_string())?);
-    // The SDK's libraries reach rustc through the compiler plan, which cargo doesn't fingerprint:
-    // a game package whose libraries differ is another key.
-    let mut libraries: Vec<(String, u64)> = Vec::new();
-    for entry in fs::read_dir(game.join("deps")).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let length = entry.metadata().map_err(|e| e.to_string())?.len();
-        libraries.push((entry.file_name().to_string_lossy().into_owned(), length));
+    // The SDK's libraries (`deps`, `host`, `native`) reach rustc and the linker through the
+    // compiler plan, which cargo doesn't fingerprint: a package any of whose files differ is
+    // another key. Each file is known by its path, length and modified time: a downloaded package
+    // was checked against its release's sums when it was unpacked, and a rebuilt local SDK writes
+    // its files anew.
+    let mut files = Vec::new();
+    for folder in ["deps", "host", "native"] {
+        sdk_files(&game.join(folder), Path::new(folder), &mut files).map_err(|e| e.to_string())?;
     }
-    libraries.sort();
-    for (name, length) in libraries {
-        hasher.update(name.as_bytes());
+    files.sort();
+    for (path, length, modified) in files {
+        hasher.update(path.as_bytes());
         hasher.update(length.to_le_bytes());
+        hasher.update(modified.to_le_bytes());
     }
     let revision = sdk.commit();
     Ok(format!(
@@ -765,6 +770,34 @@ fn kept_build(rust: &Toolchain, game: &Path) -> Result<String, String> {
         revision.get(..12).unwrap_or(revision),
         short_hash(&format!("{:x}", hasher.finalize()))
     ))
+}
+
+/// Each file under `folder` (shown as `shown`): its path, length and modified time in nanoseconds.
+fn sdk_files(
+    folder: &Path,
+    shown: &Path,
+    out: &mut Vec<(String, u64, u128)>,
+) -> std::io::Result<()> {
+    let entries = match fs::read_dir(folder) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let meta = entry.metadata()?;
+        let path = shown.join(entry.file_name());
+        if meta.is_dir() {
+            sdk_files(&entry.path(), &path, out)?;
+        } else {
+            let modified = meta
+                .modified()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |time| time.as_nanos());
+            out.push((path.to_string_lossy().into_owned(), meta.len(), modified));
+        }
+    }
+    Ok(())
 }
 
 /// The key of the mods folder a build stages: one staging folder per instance (or per CLI or
